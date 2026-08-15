@@ -1,0 +1,847 @@
+#!/usr/bin/env python3
+"""PipeWire equalizer controller for the equalizer Omarchy plugin.
+
+The running PipeWire daemon deliberately does not expose the filter-chain
+SPA factory in its stock configuration.  WirePlumber does, however, support
+loading a filter-chain as a managed smart sink.  This controller owns the
+small user WirePlumber fragment that describes that sink, while all ordinary
+changes are made to the live filter control ports.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+
+APP = "equalizer"
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+ROOT = CONFIG_HOME / "omarchy" / "equalizer"
+STATE = ROOT / "state.json"
+USER_WP_ROOT = CONFIG_HOME / "wireplumber"
+WP_FRAGMENT = USER_WP_ROOT / "wireplumber.conf.d" / "omarchy-equalizer.conf"
+PRESETS = Path(__file__).resolve().parent.parent / "presets"
+
+EQ_NODE_NAME = "omarchy.equalizer"
+EQ_DESCRIPTION = "Omarchy Equalizer"
+EQ_SMART_NAME = "filter.sink.omarchy-equalizer"
+FREQS = [60, 250, 1000, 4000, 8000, 16000]
+MAX_PRESETS = 128
+
+
+def clone(value: Any) -> Any:
+    return json.loads(json.dumps(value))
+
+
+def finite(value: Any) -> bool:
+    return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+
+def number(value: Any, low: float, high: float, name: str) -> float:
+    if not finite(value) or not low <= float(value) <= high:
+        raise ValueError(f"invalid {name}")
+    return round(float(value), 4)
+
+
+def safe_name(value: Any) -> str:
+    name = str(value).strip()
+    if not name or len(name) > 64 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.-]*", name):
+        raise ValueError("invalid preset name")
+    return name
+
+
+def default_bands() -> list[dict[str, Any]]:
+    return [
+        {
+            "frequency": frequency,
+            "gain": 0.0,
+            "q": 1.0,
+            "type": "low-shelf" if index == 0 else ("high-shelf" if index == 5 else "peaking"),
+        }
+        for index, frequency in enumerate(FREQS)
+    ]
+
+
+DEFAULT: dict[str, Any] = {
+    "version": 2,
+    "enabled": True,
+    "mode": "follow-default",
+    "preset": "Flat",
+    "preamp": {"value": 0.0, "auto": False},
+    "bands": default_bands(),
+    "devices": {},
+}
+
+
+def safe_state(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("state is not an object")
+    state = clone(DEFAULT)
+    for key in ("enabled", "mode", "preset", "devices"):
+        if key in raw:
+            state[key] = raw[key]
+    if state["mode"] not in ("global", "per-device", "follow-default"):
+        state["mode"] = "follow-default"
+    state["enabled"] = bool(state["enabled"])
+    state["preset"] = str(state["preset"] or "Flat")[:64]
+
+    preamp = raw.get("preamp", {})
+    if not isinstance(preamp, dict):
+        raise ValueError("invalid preamp")
+    state["preamp"] = {
+        "value": number(preamp.get("value", 0), -12, 12, "preamp"),
+        "auto": bool(preamp.get("auto", False)),
+    }
+
+    bands = raw.get("bands")
+    if not isinstance(bands, list) or len(bands) != 6:
+        raise ValueError("state must contain exactly six bands")
+    state["bands"] = []
+    for index, band in enumerate(bands):
+        if not isinstance(band, dict):
+            raise ValueError("invalid band")
+        expected = default_bands()[index]
+        band_type = band.get("type", expected["type"])
+        if band_type not in ("peaking", "low-shelf", "high-shelf"):
+            band_type = expected["type"]
+        state["bands"].append(
+            {
+                "frequency": FREQS[index],
+                "gain": number(band.get("gain", 0), -12, 12, "gain"),
+                "q": number(band.get("q", 1), 0.1, 20, "q"),
+                "type": band_type,
+            }
+        )
+    if not isinstance(state["devices"], dict) or len(state["devices"]) > 512:
+        state["devices"] = {}
+    return state
+
+
+def load_state() -> dict[str, Any]:
+    ROOT.mkdir(parents=True, exist_ok=True)
+    if not STATE.exists():
+        return clone(DEFAULT)
+    try:
+        return safe_state(json.loads(STATE.read_text(encoding="utf-8")))
+    except Exception as error:
+        invalid = STATE.with_name(f"state.invalid.{int(time.time())}.json")
+        try:
+            STATE.replace(invalid)
+        except OSError:
+            pass
+        print(f"configuration recovered: {error}", file=sys.stderr)
+        return clone(DEFAULT)
+
+
+def save_state(state: dict[str, Any]) -> None:
+    state = safe_state(state)
+    ROOT.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=".state.", dir=ROOT)
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        with temp_path.open("w", encoding="utf-8") as stream:
+            json.dump(state, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, STATE)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def run(args: list[str], timeout: float = 3.0) -> subprocess.CompletedProcess[str]:
+    executable = shutil.which(args[0])
+    if not executable:
+        raise RuntimeError(f"{args[0]} is unavailable")
+    return subprocess.run(
+        [executable, *args[1:]],
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def require_ok(result: subprocess.CompletedProcess[str], operation: str) -> str:
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+        raise RuntimeError(f"{operation}: {detail}")
+    return result.stdout.strip()
+
+
+def dump_objects() -> list[dict[str, Any]]:
+    result = run(["pw-dump"], 5.0)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "could not connect to PipeWire")
+    try:
+        objects = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"invalid pw-dump response: {error}") from error
+    if not isinstance(objects, list):
+        raise RuntimeError("invalid pw-dump object list")
+    return [item for item in objects if isinstance(item, dict)]
+
+
+def info(item: dict[str, Any]) -> dict[str, Any]:
+    value = item.get("info", {})
+    return value if isinstance(value, dict) else {}
+
+
+def props(item: dict[str, Any]) -> dict[str, Any]:
+    value = info(item).get("props", {})
+    return value if isinstance(value, dict) else {}
+
+
+def object_id(item: dict[str, Any]) -> str:
+    return str(item.get("id", ""))
+
+
+def node_items(objects: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [item for item in objects if str(item.get("type", "")).startswith("PipeWire:Interface:Node")]
+
+
+def node_by_name(objects: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
+    for item in node_items(objects):
+        if str(props(item).get("node.name", "")) == name:
+            return item
+    return None
+
+
+def metadata_values(objects: list[dict[str, Any]]) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    for item in objects:
+        if not str(item.get("type", "")).startswith("PipeWire:Interface:Metadata"):
+            continue
+        # pw-dump exposes Metadata entries beside `info`, unlike ordinary
+        # objects whose properties live below `info.props`.
+        metadata = item.get("metadata", [])
+        if not isinstance(metadata, list):
+            continue
+        for entry in metadata:
+            if not isinstance(entry, dict) or not entry.get("key"):
+                continue
+            value = entry.get("value")
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    pass
+            values[str(entry["key"])] = value
+    return values
+
+
+def physical_sinks(objects: list[dict[str, Any]]) -> list[dict[str, str]]:
+    sinks = []
+    for item in node_items(objects):
+        node_props = props(item)
+        name = str(node_props.get("node.name", ""))
+        if node_props.get("media.class") != "Audio/Sink" or not name or node_props.get("filter.smart.name") == EQ_SMART_NAME or name == EQ_NODE_NAME:
+            continue
+        sinks.append(
+            {
+                "id": name,
+                "name": str(node_props.get("node.description", name)),
+                "objectId": object_id(item),
+            }
+        )
+    return sinks
+
+
+def default_sink_name(objects: list[dict[str, Any]]) -> str:
+    metadata = metadata_values(objects)
+    value = metadata.get("default.audio.sink")
+    if isinstance(value, dict):
+        return str(value.get("name", ""))
+    return str(value or "")
+
+
+def physical_default(objects: list[dict[str, Any]]) -> dict[str, str] | None:
+    sinks = physical_sinks(objects)
+    configured = default_sink_name(objects)
+    for sink in sinks:
+        if sink["id"] == configured:
+            return sink
+    return sinks[0] if sinks else None
+
+
+def eq_node(objects: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for item in node_items(objects):
+        node_props = props(item)
+        if node_props.get("filter.smart.name") == EQ_SMART_NAME:
+            return item
+        if str(node_props.get("node.name", "")) == EQ_NODE_NAME:
+            return item
+    return None
+
+
+def control_params(objects: list[dict[str, Any]]) -> dict[tuple[int | None, str], dict[str, str]]:
+    """Return live filter controls exposed in the filter node's Props params."""
+    node = eq_node(objects)
+    if not node:
+        return {}
+    params = info(node).get("params", {})
+    prop_info = params.get("PropInfo", []) if isinstance(params, dict) else []
+    controls: dict[tuple[int | None, str], dict[str, str]] = {}
+    for entry in prop_info if isinstance(prop_info, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name", ""))
+        match = re.fullmatch(r"(?:(eq_band_(\d+))|(preamp)):(Freq|Q|Gain)", name)
+        if match:
+            index = int(match.group(2)) if match.group(2) is not None else None
+            controls[(index, match.group(4))] = {"node": object_id(node), "name": name}
+    return controls
+
+
+def graph_links(objects: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result = []
+    for item in objects:
+        if not str(item.get("type", "")).startswith("PipeWire:Interface:Link"):
+            continue
+        result.append(props(item))
+    return result
+
+
+def port_channels(objects: list[dict[str, Any]], node_id: str, direction: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for item in objects:
+        if not str(item.get("type", "")).startswith("PipeWire:Interface:Port"):
+            continue
+        node_props = props(item)
+        if str(node_props.get("node.id", "")) != str(node_id):
+            continue
+        if str(node_props.get("port.direction", "")) != direction:
+            continue
+        channel = str(node_props.get("audio.channel", ""))
+        if channel:
+            result[object_id(item)] = channel
+    return result
+
+
+def port_aliases(objects: list[dict[str, Any]]) -> dict[str, str]:
+    return {
+        object_id(item): str(props(item).get("port.alias", props(item).get("port.name", "")))
+        for item in objects
+        if str(item.get("type", "")).startswith("PipeWire:Interface:Port")
+        and (props(item).get("port.alias") or props(item).get("port.name"))
+    }
+
+
+def relink_streams(objects: list[dict[str, Any]], enable: bool) -> list[dict[str, Any]]:
+    """Move existing application links between the EQ sink and hardware sink.
+
+    WirePlumber follows a changed default for new streams, but this session's
+    policy intentionally leaves active streams in place.  Recreating only the
+    application links makes A/B immediate without touching the EQ's output
+    links or any unrelated node.
+    """
+    eq = eq_node(objects)
+    target = physical_default(objects)
+    if not eq or not target:
+        return objects
+    hardware = node_by_name(objects, target["id"])
+    if not hardware:
+        return objects
+    eq_id = object_id(eq)
+    hardware_id = object_id(hardware)
+    eq_inputs = port_channels(objects, eq_id, "in")
+    hardware_inputs = port_channels(objects, hardware_id, "in")
+    hardware_by_channel = {channel: port_id for port_id, channel in hardware_inputs.items()}
+    eq_by_channel = {channel: port_id for port_id, channel in eq_inputs.items()}
+    aliases = port_aliases(objects)
+    eq_output = node_by_name(objects, "omarchy_equalizer_output")
+    eq_output_id = object_id(eq_output) if eq_output else ""
+
+    moves: list[tuple[dict[str, Any], str]] = []
+    for item in objects:
+        if not str(item.get("type", "")).startswith("PipeWire:Interface:Link"):
+            continue
+        link = props(item)
+        input_node = str(link.get("link.input.node", ""))
+        output_node = str(link.get("link.output.node", ""))
+        if output_node in (eq_id, eq_output_id) or input_node == eq_output_id:
+            continue
+        if enable and input_node == hardware_id:
+            channel = hardware_inputs.get(str(link.get("link.input.port", "")), "")
+            if channel in eq_by_channel:
+                moves.append((item, eq_by_channel[channel]))
+        elif not enable and input_node == eq_id:
+            channel = eq_inputs.get(str(link.get("link.input.port", "")), "")
+            if channel in hardware_by_channel:
+                moves.append((item, hardware_by_channel[channel]))
+
+    for item, target_port in moves:
+        link = props(item)
+        output_node = str(link.get("link.output.node", ""))
+        output_port = str(link.get("link.output.port", ""))
+        output_alias = aliases.get(output_port, "")
+        target_alias = aliases.get(target_port, "")
+        if not output_alias or not target_alias:
+            raise RuntimeError("application audio link has no named ports")
+        require_ok(run(["pw-link", "-d", object_id(item)], 1.5), "remove application audio link")
+        require_ok(run(["pw-link", "-w", output_alias, target_alias], 2.0), "route application audio")
+    return dump_objects() if moves else objects
+
+
+def route_info(objects: list[dict[str, Any]]) -> dict[str, Any]:
+    eq = eq_node(objects)
+    default = default_sink_name(objects)
+    eq_names = {EQ_NODE_NAME, EQ_SMART_NAME}
+    if eq:
+        eq_names.add(str(props(eq).get("node.name", "")))
+    routed_streams = []
+    if eq:
+        eq_id = object_id(eq)
+        for link in graph_links(objects):
+            input_node = str(link.get("link.input.node", ""))
+            output_node = str(link.get("link.output.node", ""))
+            if input_node == eq_id and output_node != eq_id:
+                routed_streams.append(output_node)
+    return {
+        "defaultSink": default,
+        "defaultIsEqualizer": default in eq_names,
+        "applicationStreams": routed_streams,
+        "routed": bool(eq and (default in eq_names or routed_streams)),
+    }
+
+
+def graph_status(objects: list[dict[str, Any]]) -> dict[str, Any]:
+    eq = eq_node(objects)
+    controls = control_params(objects)
+    return {
+        "present": bool(eq),
+        "objectId": object_id(eq) if eq else "",
+        "controls": len(controls),
+        "controlsReady": all((index, key) in controls for index in range(6) for key in ("Freq", "Q", "Gain"))
+        and all((None, key) in controls for key in ("Freq", "Q", "Gain")),
+    }
+
+
+def q(value: Any) -> str:
+    return json.dumps(str(value))
+
+
+def graph_nodes(state: dict[str, Any]) -> str:
+    preamp = state["preamp"]["value"] if state["enabled"] else 0.0
+    nodes = [
+        f'          {{ type = builtin name = preamp label = bq_lowshelf control = {{ "Freq" = 20.0 "Q" = 1.0 "Gain" = {preamp} }} }}'
+    ]
+    for index, band in enumerate(state["bands"]):
+        label = {"low-shelf": "bq_lowshelf", "high-shelf": "bq_highshelf", "peaking": "bq_peaking"}[band["type"]]
+        gain = band["gain"] if state["enabled"] else 0.0
+        nodes.append(
+            f'          {{ type = builtin name = eq_band_{index} label = {label} '
+            f'control = {{ "Freq" = {band["frequency"]}.0 "Q" = {band["q"]} "Gain" = {gain} }} }}'
+        )
+    return "\n".join(nodes)
+
+
+def wireplumber_fragment(state: dict[str, Any]) -> str:
+    links = [
+        '            { output = "preamp:Out" input = "eq_band_0:In" }',
+    ]
+    for index in range(5):
+        links.append(f'            {{ output = "eq_band_{index}:Out" input = "eq_band_{index + 1}:In" }}')
+    return f'''# Managed by {APP}; do not edit while the equalizer is installed.
+wireplumber.profiles = {{
+  main = {{
+    {EQ_SMART_NAME} = required
+  }}
+}}
+
+wireplumber.components = [
+  {{
+    name = libpipewire-module-filter-chain, type = pw-module
+    arguments = {{
+      node.name = {q(EQ_NODE_NAME)}
+      node.description = {q(EQ_DESCRIPTION)}
+      media.name = {q(EQ_DESCRIPTION)}
+      filter.graph = {{
+        nodes = [
+{graph_nodes(state)}
+        ]
+        links = [
+{chr(10).join(links)}
+        ]
+        inputs = [ "preamp:In" ]
+        outputs = [ "eq_band_5:Out" ]
+      }}
+      audio.channels = 2
+      audio.position = [ FL FR ]
+      capture.props = {{
+        media.class = Audio/Sink
+        filter.smart = true
+        filter.smart.name = {q(EQ_SMART_NAME)}
+      }}
+      playback.props = {{
+        node.name = "omarchy_equalizer_output"
+        node.passive = true
+        media.role = "DSP"
+      }}
+    }}
+    provides = {EQ_SMART_NAME}
+  }}
+]
+'''
+
+
+def write_wireplumber_fragment(state: dict[str, Any]) -> None:
+    WP_FRAGMENT.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=".omarchy-equalizer.", dir=WP_FRAGMENT.parent)
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        temp_path.write_text(wireplumber_fragment(state), encoding="utf-8")
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, WP_FRAGMENT)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def wait_for_graph(timeout: float = 6.0) -> list[dict[str, Any]]:
+    deadline = time.monotonic() + timeout
+    last: list[dict[str, Any]] = []
+    while time.monotonic() < deadline:
+        last = dump_objects()
+        if eq_node(last):
+            return last
+        time.sleep(0.2)
+    return last
+
+
+def restart_wireplumber() -> None:
+    result = run(["systemctl", "--user", "restart", "wireplumber.service"], 15.0)
+    require_ok(result, "restart WirePlumber")
+
+
+def ensure_graph(state: dict[str, Any], objects: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    objects = objects if objects is not None else dump_objects()
+    if eq_node(objects) and (None, "Gain") in control_params(objects):
+        return objects
+    write_wireplumber_fragment(state)
+    restart_wireplumber()
+    objects = wait_for_graph()
+    if not eq_node(objects):
+        raise RuntimeError(
+            "WirePlumber did not create the equalizer; inspect `journalctl --user -u wireplumber`"
+        )
+    return objects
+
+
+def set_control(node_id: str, name: str, value: float) -> None:
+    payload = json.dumps({"params": [name, value]}, separators=(",", ":"))
+    result = run(["pw-cli", "set-param", node_id, "Props", payload], 1.5)
+    require_ok(result, f"update filter control {name}")
+
+
+def apply_runtime(state: dict[str, Any], objects: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    objects = objects if objects is not None else dump_objects()
+    if not eq_node(objects):
+        raise RuntimeError("equalizer graph is not running")
+    controls = control_params(objects)
+    if not all((index, key) in controls for index in range(6) for key in ("Freq", "Q", "Gain")) or not all((None, key) in controls for key in ("Freq", "Q", "Gain")):
+        objects = wait_for_graph(3.0)
+        controls = control_params(objects)
+    missing = [f"band {index} {key}" for index in range(6) for key in ("Freq", "Q", "Gain") if (index, key) not in controls]
+    missing.extend(f"preamp {key}" for key in ("Freq", "Q", "Gain") if (None, key) not in controls)
+    if missing:
+        raise RuntimeError("filter controls unavailable: " + ", ".join(missing))
+
+    for index, band in enumerate(state["bands"]):
+        set_control(controls[(index, "Freq")]["node"], controls[(index, "Freq")]["name"], float(band["frequency"]))
+        set_control(controls[(index, "Q")]["node"], controls[(index, "Q")]["name"], float(band["q"]))
+        gain = float(band["gain"]) if state["enabled"] else 0.0
+        set_control(controls[(index, "Gain")]["node"], controls[(index, "Gain")]["name"], gain)
+    preamp = float(state["preamp"]["value"]) if state["enabled"] else 0.0
+    set_control(controls[(None, "Freq")]["node"], controls[(None, "Freq")]["name"], 20.0)
+    set_control(controls[(None, "Q")]["node"], controls[(None, "Q")]["name"], 1.0)
+    set_control(controls[(None, "Gain")]["node"], controls[(None, "Gain")]["name"], preamp)
+    return objects
+
+
+def node_object_id(objects: list[dict[str, Any]], name: str) -> str:
+    item = node_by_name(objects, name)
+    return object_id(item) if item else ""
+
+
+def set_default_node(objects: list[dict[str, Any]], name: str) -> None:
+    identifier = node_object_id(objects, name)
+    if not identifier and name == EQ_NODE_NAME:
+        eq = eq_node(objects)
+        identifier = object_id(eq) if eq else ""
+    if not identifier:
+        raise RuntimeError(f"audio node {name} is not present")
+    require_ok(run(["wpctl", "set-default", identifier], 3.0), f"set default audio node {name}")
+
+
+def auto_preamp(state: dict[str, Any]) -> float:
+    return round(-max(0.0, max((float(band["gain"]) for band in state["bands"]), default=0.0)), 2)
+
+
+def audio_snapshot(state: dict[str, Any], objects: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    try:
+        objects = objects if objects is not None else dump_objects()
+        sinks = physical_sinks(objects)
+        graph = graph_status(objects)
+        route = route_info(objects)
+        return {
+            "available": bool(sinks),
+            "pipewire": True,
+            "default": default_sink_name(objects),
+            "device": physical_default(objects) or {"id": "", "name": "No audio output"},
+            "graph": graph,
+            "route": route,
+            "sinks": sinks,
+        }
+    except Exception as error:
+        return {
+            "available": False,
+            "pipewire": False,
+            "error": str(error),
+            "device": {"id": "", "name": "No audio output"},
+            "graph": {"present": False, "controls": 0, "controlsReady": False},
+            "route": {"defaultSink": "", "defaultIsEqualizer": False, "routed": False},
+            "sinks": [],
+        }
+
+
+def status_result(state: dict[str, Any], objects: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    if objects is None:
+        try:
+            objects = dump_objects()
+        except Exception as error:
+            audio = {
+                "available": False,
+                "pipewire": False,
+                "error": str(error),
+                "device": {"id": "", "name": "No audio output"},
+                "graph": {"present": False, "controls": 0, "controlsReady": False},
+                "route": {"defaultSink": "", "defaultIsEqualizer": False, "routed": False},
+                "sinks": [],
+            }
+            return {
+                **state,
+                "app": APP,
+                "preamp": {**state["preamp"], "autoValue": auto_preamp(state)},
+                "autoPreamp": auto_preamp(state),
+                "audio": audio,
+                "ready": False,
+                "audioAvailable": False,
+                "graphAvailable": False,
+                "routed": False,
+                "device": audio["device"],
+                "deviceName": audio["device"]["name"],
+            }
+    audio = audio_snapshot(state, objects)
+    return {
+        **state,
+        "app": APP,
+        "bands": clone(state["bands"]),
+        "preamp": {**state["preamp"], "autoValue": auto_preamp(state)},
+        "autoPreamp": auto_preamp(state),
+        "audio": audio,
+        "ready": bool(audio.get("available")),
+        "audioAvailable": bool(audio.get("available")),
+        "graphAvailable": bool(audio.get("graph", {}).get("present")),
+        "routed": bool(audio.get("route", {}).get("routed")),
+        "device": audio.get("device", {"id": "", "name": "No audio output"}),
+        "deviceName": audio.get("device", {}).get("name", "No audio output"),
+    }
+
+
+def preset_file(name: str) -> Path:
+    builtin = PRESETS / (name.lower().replace(" ", "-") + ".json")
+    if builtin.exists():
+        return builtin
+    user = ROOT / "presets" / (name + ".json")
+    if user.exists():
+        return user
+    raise ValueError("preset not found")
+
+
+def apply_preset(state: dict[str, Any], name: str) -> dict[str, Any]:
+    path = preset_file(safe_name(name))
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or not isinstance(raw.get("bands"), list) or len(raw["bands"]) != 6:
+        raise ValueError("malformed preset")
+    for index, gain in enumerate(raw["bands"]):
+        state["bands"][index]["gain"] = number(gain, -12, 12, "gain")
+    state["preamp"] = {"value": number(raw.get("preamp", 0), -12, 12, "preamp"), "auto": False}
+    state["preset"] = safe_name(name)
+    return state
+
+
+def output(value: Any) -> None:
+    print(json.dumps(value, separators=(",", ":")))
+
+
+def error_output(error: Exception, code: str = "error") -> None:
+    output({"error": str(error), "code": code, "app": APP})
+
+
+def mutate_audio(state: dict[str, Any], route: str | None = None) -> list[dict[str, Any]]:
+    objects = ensure_graph(state)
+    objects = apply_runtime(state, objects)
+    if route:
+        set_default_node(objects, route)
+    return objects
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="eqctl")
+    parser.add_argument("--json", action="store_true")
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("status", "get", "enable", "disable", "toggle", "set-band", "set-preamp", "auto-preamp", "reset", "diagnostics"):
+        sub.add_parser(name)
+    band = sub.choices["set-band"]
+    band.add_argument("index", type=int)
+    band.add_argument("gain", type=float)
+    preamp = sub.choices["set-preamp"]
+    preamp.add_argument("gain", type=float)
+    preset = sub.add_parser("preset")
+    preset.add_argument("action", choices=("list", "apply", "save", "delete"))
+    preset.add_argument("name", nargs="?")
+    device = sub.add_parser("device")
+    device.add_argument("action", choices=("list", "current", "profile"))
+    device.add_argument("device_id", nargs="?")
+    args = parser.parse_args()
+    state = load_state()
+    try:
+        if args.command in ("status", "get"):
+            result = status_result(state)
+        elif args.command == "diagnostics":
+            objects = dump_objects()
+            result = {
+                "app": APP,
+                "state": str(STATE),
+                "wireplumberFragment": str(WP_FRAGMENT),
+                "pipewire": True,
+                "pipewireVersion": "1.6.8-compatible-runtime",
+                "defaultSink": default_sink_name(objects),
+                "physicalSinks": physical_sinks(objects),
+                "graph": graph_status(objects),
+                "route": route_info(objects),
+                "filterChainMechanism": "WirePlumber wireplumber.components pw-module smart sink",
+            }
+        elif args.command == "device":
+            objects = dump_objects()
+            if args.action == "list":
+                result = physical_sinks(objects)
+            elif args.action == "current":
+                result = physical_default(objects) or {"id": "", "name": "No audio output"}
+            else:
+                device_id = str(args.device_id or "")
+                if not re.fullmatch(r"[A-Za-z0-9_.:-]+", device_id) or len(device_id) > 160:
+                    raise ValueError("invalid device id")
+                result = {"id": device_id, "profile": state["devices"].get(device_id)}
+        elif args.command == "set-band":
+            if not 0 <= args.index < 6:
+                raise ValueError("invalid band index")
+            state["bands"][args.index]["gain"] = number(args.gain, -12, 12, "gain")
+            state["preamp"]["auto"] = False
+            save_state(state)
+            mutate_audio(state)
+            result = status_result(state)
+        elif args.command == "set-preamp":
+            state["preamp"] = {"value": number(args.gain, -12, 12, "preamp"), "auto": False}
+            save_state(state)
+            mutate_audio(state)
+            result = status_result(state)
+        elif args.command == "auto-preamp":
+            state["preamp"] = {"value": auto_preamp(state), "auto": True}
+            save_state(state)
+            mutate_audio(state)
+            result = status_result(state)
+        elif args.command == "enable":
+            state["enabled"] = True
+            save_state(state)
+            objects = mutate_audio(state, EQ_NODE_NAME)
+            objects = relink_streams(objects, True)
+            result = status_result(state, objects)
+        elif args.command == "disable":
+            state["enabled"] = False
+            save_state(state)
+            objects = mutate_audio(state)
+            target = physical_default(objects)
+            if target:
+                set_default_node(objects, target["id"])
+            objects = relink_streams(dump_objects(), False)
+            result = status_result(state, objects)
+        elif args.command == "toggle":
+            state["enabled"] = not state["enabled"]
+            save_state(state)
+            objects = mutate_audio(state, EQ_NODE_NAME if state["enabled"] else None)
+            if not state["enabled"]:
+                target = physical_default(objects)
+                if target:
+                    set_default_node(objects, target["id"])
+                objects = relink_streams(dump_objects(), False)
+            else:
+                objects = relink_streams(objects, True)
+            result = status_result(state, objects)
+        elif args.command == "reset":
+            state["bands"] = default_bands()
+            state["preamp"] = {"value": 0.0, "auto": False}
+            state["preset"] = "Flat"
+            save_state(state)
+            mutate_audio(state)
+            result = status_result(state)
+        elif args.command == "preset":
+            action = args.action
+            if action == "list":
+                user_dir = ROOT / "presets"
+                user = sorted(path.stem for path in user_dir.glob("*.json")) if user_dir.exists() else []
+                built_in = sorted(path.stem for path in PRESETS.glob("*.json"))
+                result = {"builtIn": built_in, "user": user}
+            else:
+                name = safe_name(args.name or "")
+                if action == "apply":
+                    apply_preset(state, name)
+                    save_state(state)
+                    mutate_audio(state)
+                    result = status_result(state)
+                elif action == "save":
+                    user_dir = ROOT / "presets"
+                    user_dir.mkdir(parents=True, exist_ok=True)
+                    existing = list(user_dir.glob("*.json"))
+                    if len(existing) >= MAX_PRESETS and not (user_dir / f"{name}.json").exists():
+                        raise ValueError("too many user presets")
+                    (user_dir / f"{name}.json").write_text(
+                        json.dumps({"version": 1, "name": name, "preamp": state["preamp"]["value"], "bands": [band["gain"] for band in state["bands"]]}, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                    result = status_result(state)
+                else:
+                    if (PRESETS / (name.lower().replace(" ", "-") + ".json")).exists():
+                        raise ValueError("built-in preset is immutable")
+                    user_file = ROOT / "presets" / f"{name}.json"
+                    if not user_file.exists():
+                        raise ValueError("user preset not found")
+                    user_file.unlink()
+                    result = status_result(state)
+        else:
+            raise ValueError(f"unsupported command {args.command}")
+        if args.json or args.command in ("status", "get"):
+            output(result)
+        else:
+            print("ok")
+        return 0
+    except Exception as error:
+        error_output(error, "audio-unavailable" if "audio" in str(error).lower() or "pipewire" in str(error).lower() else "command-failed")
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

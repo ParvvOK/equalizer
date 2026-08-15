@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "equalizer",
+  "name": "Equalizer",
+  "version": "1.0.0",
+  "author": "Omarchy community",
+  "license": "MIT",
+  "description": "A native six-band PipeWire equalizer for the Omarchy bar.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "Equalizer",
+    "description": "Six-band equalizer with per-device profiles",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
