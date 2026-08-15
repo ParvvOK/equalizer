@@ -2,7 +2,7 @@
 
 `equalizer` is a native Quickshell/Quattro bar widget backed by one WirePlumber-managed PipeWire filter-chain smart sink. It provides six bands at 60 Hz, 250 Hz, 1 kHz, 4 kHz, 8 kHz and 16 kHz, persistent state, built-in/user presets, and recovery-friendly diagnostics.
 
-![preview](img.png)
+![preview](preview.png)
 
 ## Install and enable
 
