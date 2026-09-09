@@ -462,7 +462,7 @@ wireplumber.profiles = {{
 
 wireplumber.components = [
   {{
-    name = libpipewire-module-filter-chain, type = pw-module
+    name = libpipewire-module-filter-chain, type = pw-module-client
     arguments = {{
       node.name = {q(EQ_NODE_NAME)}
       node.description = {q(EQ_DESCRIPTION)}
@@ -733,7 +733,7 @@ def main() -> int:
                 "physicalSinks": physical_sinks(objects),
                 "graph": graph_status(objects),
                 "route": route_info(objects),
-                "filterChainMechanism": "WirePlumber wireplumber.components pw-module smart sink",
+                "filterChainMechanism": "WirePlumber wireplumber.components pw-module-client smart sink",
             }
         elif args.command == "device":
             objects = dump_objects()

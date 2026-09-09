@@ -206,7 +206,7 @@ Panel {
 
     onExited: {
       root.runNextMutation()
-      if (!root.mutationProcess.running && root.pendingCommands.length === 0 && root.errorMessage !== "")
+      if (!mutationProcess.running && root.pendingCommands.length === 0 && root.errorMessage !== "")
         root.refreshTimer.restart()
     }
   }
