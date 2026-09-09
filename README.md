@@ -60,6 +60,8 @@ Auto-preamp is the negative maximum positive EQ gain. Reset means zero band gain
 
 Run `eqctl diagnostics --json`, verify `pw-dump` and `wpctl` are available, and check that the user PipeWire session is running. After a PipeWire restart, reopen the panel; the controller retries the status path and reapplies saved values. If the device is unplugged, its saved profile remains.
 
+**removing the plugin using the inbuilt *omarchy  plugin remove* doesnt clear the config files and the equalizer will still show up in the audio widget in the shell as a source if causing any problem, run remove.sh and all the orphaned config files shall be pruned.**
+
 ## Security
 
 The plugin runs unsandboxed inside Quickshell, so the backend is intentionally narrow. It uses direct executable argument arrays, never `sh -c`, `eval`, privilege escalation, network access, telemetry, or arbitrary PipeWire command forwarding. Inputs, JSON, preset names, frequencies, gains, Q values, and profile sizes are bounded. It writes only the equalizer state/preset directory and its own WirePlumber fragment.
