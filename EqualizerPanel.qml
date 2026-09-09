@@ -17,7 +17,7 @@ Panel {
   property string errorMessage: ""
   property var pendingCommands: []
   property var pendingBands: ({})
-  property var presetNames: ["Flat", "Acoustic", "Bass Boost", "Classical", "Electronic", "Jazz", "Pop", "Rock", "Treble Boost", "Vocal"]
+  property var presetNames: ["Best","Flat", "Acoustic", "Bass Boost", "Classical", "Electronic", "Jazz", "Pop", "Rock", "Treble Boost", "Vocal"]
   property string backendPath: String(Qt.resolvedUrl("backend/eqctl")).replace(/^file:\/\//, "")
   property var state: ({
     ready: false,
