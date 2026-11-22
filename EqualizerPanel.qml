@@ -411,14 +411,13 @@ Panel {
               onClicked: root.enqueue(["auto-preamp"])
             }
 
-            Text {
+            GainField {
               id: preampValue
-              width: Style.space(66)
-              text: (root.state.preamp >= 0 ? "+" : "") + Number(root.state.preamp).toFixed(1) + " dB"
-              color: Color.menu.text
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
+              width: Style.space(84)
+              value: Number(root.state.preamp) || 0
+              suffix: " dB"
               horizontalAlignment: Text.AlignRight
+              onCommitted: function(value) { root.setPreamp(value) }
               anchors.right: autoPreampButton.left
               anchors.rightMargin: Style.spacing.md
               anchors.verticalCenter: parent.verticalCenter

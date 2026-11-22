@@ -17,14 +17,12 @@ Item {
     anchors.fill: parent
     spacing: Style.spacing.xs
 
-    Text {
+    GainField {
       width: parent.width
-      text: (root.value >= 0 ? "+" : "") + root.value.toFixed(1)
-      color: root.dragging ? Color.accent : Color.menu.text
-      font.family: Style.font.family
-      font.pixelSize: Style.font.bodySmall
-      font.bold: true
-      horizontalAlignment: Text.AlignHCenter
+      value: root.value
+      textColor: root.dragging ? Color.accent : Color.menu.text
+      bold: true
+      onCommitted: function(value) { root.changed(value) }
     }
 
     Item {
