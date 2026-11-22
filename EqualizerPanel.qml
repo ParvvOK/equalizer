@@ -18,6 +18,7 @@ Panel {
   property var pendingCommands: []
   property var pendingBands: ({})
   property var presetNames: ["Best","Flat", "Acoustic", "Bass Boost", "Classical", "Electronic", "Jazz", "Pop", "Rock", "Treble Boost", "Vocal"]
+  property var userPresetNames: []
   property string backendPath: String(Qt.resolvedUrl("backend/eqctl")).replace(/^file:\/\//, "")
   property var state: ({
     ready: false,
@@ -111,6 +112,21 @@ Panel {
   function refresh() {
     if (!statusProcess.running)
       statusProcess.running = true
+    refreshPresets()
+  }
+
+  function refreshPresets() {
+    if (!presetListProcess.running)
+      presetListProcess.running = true
+  }
+
+  function parsePresetList(text) {
+    try {
+      var result = JSON.parse(String(text || "").trim())
+      var user = result.user || []
+      userPresetNames = user.filter(function(name) { return presetNames.indexOf(String(name)) === -1 }).map(String)
+    } catch (e) {
+    }
   }
 
   function enqueue(args) {
@@ -206,8 +222,19 @@ Panel {
 
     onExited: {
       root.runNextMutation()
+      root.refreshPresets()
       if (!mutationProcess.running && root.pendingCommands.length === 0 && root.errorMessage !== "")
         refreshTimer.restart()
+    }
+  }
+
+  Process {
+    id: presetListProcess
+    command: [root.backendPath, "--json", "preset", "list"]
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.parsePresetList(text)
     }
   }
 
@@ -381,7 +408,7 @@ Panel {
               width: Math.max(Style.space(180), parent.width - Style.space(68) - parent.spacing)
               showLabel: false
               value: root.state.preset
-              options: root.presetNames
+              options: root.presetNames.concat(root.userPresetNames)
               onChanged: function(value) {
                 root.applyPreset(value)
                 // Dropdown assigns `value` when an option is picked, which
