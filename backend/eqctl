@@ -304,6 +304,48 @@ def control_params(objects: list[dict[str, Any]]) -> dict[tuple[int | None, str]
     return controls
 
 
+def live_control_values(objects: list[dict[str, Any]]) -> dict[str, float]:
+    """Return the current value of each filter control, keyed by control name."""
+    node = eq_node(objects)
+    if not node:
+        return {}
+    params = info(node).get("params", {})
+    entries = params.get("Props", []) if isinstance(params, dict) else []
+    values: dict[str, float] = {}
+    for entry in entries if isinstance(entries, list) else []:
+        raw = entry.get("params") if isinstance(entry, dict) else None
+        if not isinstance(raw, list):
+            continue
+        for i in range(0, len(raw) - 1, 2):
+            if isinstance(raw[i], str) and finite(raw[i + 1]):
+                values[raw[i]] = float(raw[i + 1])
+    return values
+
+
+def expected_control_values(state: dict[str, Any]) -> dict[str, float]:
+    """Return the control values apply_runtime() writes for this state."""
+    enabled = state["enabled"]
+    expected = {
+        "preamp:Freq": 20.0,
+        "preamp:Q": 1.0,
+        "preamp:Gain": float(state["preamp"]["value"]) if enabled else 0.0,
+    }
+    for index, band in enumerate(state["bands"]):
+        expected[f"eq_band_{index}:Freq"] = float(band["frequency"])
+        expected[f"eq_band_{index}:Q"] = float(band["q"])
+        expected[f"eq_band_{index}:Gain"] = float(band["gain"]) if enabled else 0.0
+    return expected
+
+
+def runtime_drifted(state: dict[str, Any], objects: list[dict[str, Any]]) -> bool:
+    """True when the running filter is readable and no longer matches saved state."""
+    live = live_control_values(objects)
+    expected = expected_control_values(state)
+    if any(name not in live for name in expected):
+        return False
+    return any(abs(live[name] - value) > 0.001 for name, value in expected.items())
+
+
 def graph_links(objects: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result = []
     for item in objects:
@@ -510,6 +552,21 @@ def write_wireplumber_fragment(state: dict[str, Any]) -> None:
             temp_path.unlink()
 
 
+def sync_wireplumber_fragment(state: dict[str, Any]) -> None:
+    """Keep the fragment's startup values equal to the saved state.
+
+    WirePlumber builds the filter from this fragment whenever it starts, so a
+    stale copy makes every reboot or WirePlumber restart run old gains. Only
+    rewrite on change; this does not restart WirePlumber.
+    """
+    try:
+        if WP_FRAGMENT.read_text(encoding="utf-8") == wireplumber_fragment(state):
+            return
+    except OSError:
+        pass
+    write_wireplumber_fragment(state)
+
+
 def wait_for_graph(timeout: float = 6.0) -> list[dict[str, Any]]:
     deadline = time.monotonic() + timeout
     last: list[dict[str, Any]] = []
@@ -694,8 +751,28 @@ def error_output(error: Exception, code: str = "error") -> None:
 def mutate_audio(state: dict[str, Any], route: str | None = None) -> list[dict[str, Any]]:
     objects = ensure_graph(state)
     objects = apply_runtime(state, objects)
+    sync_wireplumber_fragment(state)
     if route:
         set_default_node(objects, route)
+    return objects
+
+
+def reconcile_audio(state: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Re-apply saved state if the running filter drifted (e.g. after a restart).
+
+    Called from status, so it never raises: status must still report whatever
+    is running when PipeWire is unavailable or a control write fails.
+    """
+    try:
+        objects = dump_objects()
+    except Exception:
+        return None
+    try:
+        sync_wireplumber_fragment(state)
+        if eq_node(objects) and runtime_drifted(state, objects):
+            objects = apply_runtime(state, objects)
+    except Exception:
+        pass
     return objects
 
 
@@ -720,7 +797,7 @@ def main() -> int:
     state = load_state()
     try:
         if args.command in ("status", "get"):
-            result = status_result(state)
+            result = status_result(state, reconcile_audio(state))
         elif args.command == "diagnostics":
             objects = dump_objects()
             result = {

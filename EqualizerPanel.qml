@@ -207,7 +207,7 @@ Panel {
     onExited: {
       root.runNextMutation()
       if (!mutationProcess.running && root.pendingCommands.length === 0 && root.errorMessage !== "")
-        root.refreshTimer.restart()
+        refreshTimer.restart()
     }
   }
 
@@ -382,7 +382,13 @@ Panel {
               showLabel: false
               value: root.state.preset
               options: root.presetNames
-              onChanged: root.applyPreset(value)
+              onChanged: function(value) {
+                root.applyPreset(value)
+                // Dropdown assigns `value` when an option is picked, which
+                // breaks the binding above; restore it so the label keeps
+                // following the backend's preset instead of the last pick.
+                presetDropdown.value = Qt.binding(function() { return root.state.preset })
+              }
             }
           }
 
